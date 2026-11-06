@@ -1,0 +1,8 @@
+.pio/
+.vscode/
+.idea/
+.DS_Store
+*.log
+firmware/*.bin
+sav v1.0.0/
+@eaDir/
