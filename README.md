@@ -27,8 +27,10 @@ Standalone monitor for **Bitaxe Gamma** (AxeOS) on the **ESP32-2432S028R**
   configured automatically after Wi-Fi connects).
 - **Screen timeout**: optional blanking after inactivity, wake on touch.
 - **Offline alert**: large red exclamation mark and `BITAXE OFFLINE` / `WIFI OFFLINE`.
-- **New record**: white background with dark-blue `NEW!`, shown for 2 s, then
-  0.4 s of white, then 2 s again.
+- **New best diff ever**: full-screen value blinking between dark-red/white and
+  white/red until the screen is touched.
+- **New session record**: white background with dark-blue `NEW!`, shown for 2 s,
+  then 0.4 s of white, then 2 s again.
 - **RGB LED**: blinks for 2 s on a new record, selectable best ever / best session / both.
 - Status bar: online / miner offline / no Wi-Fi + signal level.
 - Footer: last update age and monitor IP.
@@ -253,8 +255,12 @@ suffixed strings (`4.29G`, `144.5T`). The firmware handles both formats.
 - **BITAXE OFFLINE**: the AxeOS API no longer responds; a large red `!` replaces
   the main value and a red border surrounds the card.
 - **WIFI OFFLINE**: the monitor lost Wi-Fi; same alert, different text.
-- **New record**: white background and dark-blue `NEW!`, shown for 2 s, then
-  0.4 s of white, then 2 s again, when `bestDiff` or `bestSessionDiff` increases.
+- **New best diff ever**: full-screen `bestDiff` value alternates between a dark
+  red background with white text and a white background with red text. It stays
+  until a touch; if the record increases again, the displayed value updates and
+  blinking continues. Only `bestDiff` triggers this overlay.
+- **New session record**: white background and dark-blue `NEW!`, shown for 2 s,
+  then 0.4 s of white, then 2 s again, when `bestSessionDiff` increases.
   The RGB LED blinks for 2 s according to the selected mode.
 - **BLOCK FOUND**: 6-second full-screen animation when `blockFound` changes to 1.
 
@@ -264,8 +270,8 @@ The GitHub Actions workflow builds all four display variants on pushes to
 `main`/`master`, on tags, and on pull requests. To publish a release, push a tag:
 
 ```bash
-git tag v1.1.0
-git push origin v1.1.0
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
 The workflow builds the firmware and attaches the `firmware/*.bin` files to the

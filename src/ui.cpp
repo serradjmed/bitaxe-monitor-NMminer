@@ -5,6 +5,9 @@
 namespace {
 
 constexpr uint8_t BL_LEDC_CHANNEL = 0;
+constexpr unsigned long BEST_EVER_BLINK_MS = 500UL;
+constexpr uint16_t C_BEST_EVER_BG = rgb565(105, 0, 0);
+constexpr uint16_t C_BEST_EVER_RED = rgb565(185, 16, 16);
 
 const uint8_t* const FONT_TINY = u8g2_font_helvB08_tf;
 const uint8_t* const FONT_SMALL = u8g2_font_helvB10_tf;
@@ -78,6 +81,10 @@ void UI::applyDisplaySettings(uint8_t orientation, bool flip, uint8_t brightness
   _ts.setRotation(_rotation);
 
   _flashing = false;
+  _bestEverActive = false;
+  _bestEverPhase = false;
+  _bestEverNext = 0;
+  _bestEverValue = "";
   _celebrating = false;
   _ledBlinking = false;
   setLed(false);
@@ -188,7 +195,7 @@ void UI::applyPowerState() {
 
   bool night = isNightNow();
   _nightActive = night;
-  bool timedOut = _screenTimeoutSec > 0 &&
+  bool timedOut = !_bestEverActive && _screenTimeoutSec > 0 &&
                   (now - _lastTouchMs) >= static_cast<unsigned long>(_screenTimeoutSec) * 1000UL;
   _screenOff = timedOut;
 
@@ -262,11 +269,35 @@ void UI::update(const MinerData& data) {
   updateLed();
   if (millis() - _lastPowerCheckMs >= 1000UL) applyPowerState();
 
+  bool live = data.online && data.everConnected;
+
   if (_celebrating) {
     if (millis() < _celebrateUntil) return;
     _celebrating = false;
     _staticDrawn = false;
     _forceAll = true;
+  }
+
+  if (live && _recordInit && data.bestDiff > _lastBestDiff) {
+    bool sessionRecord = data.bestSessionDiff > _lastSessionDiff;
+    _lastBestDiff = data.bestDiff;
+    _lastSessionDiff = data.bestSessionDiff;
+    bool led = (data.ledMode == 3) || (data.ledMode == 1) ||
+               (data.ledMode == 2 && sessionRecord);
+    showBestEverRecord(formatDiff(data.bestDiff, true), led);
+    return;
+  }
+
+  if (_bestEverActive) {
+    if (live && _recordInit && data.bestSessionDiff > _lastSessionDiff) {
+      _lastSessionDiff = data.bestSessionDiff;
+    }
+    if (millis() >= _bestEverNext) {
+      _bestEverPhase = !_bestEverPhase;
+      _bestEverNext = millis() + BEST_EVER_BLINK_MS;
+      drawBestEverOverlay();
+    }
+    return;
   }
 
   if (_flashing) {
@@ -391,13 +422,11 @@ void UI::update(const MinerData& data) {
       _lastSessionDiff = data.bestSessionDiff;
       _recordInit = true;
     } else {
-      bool bestRecord = data.bestDiff > _lastBestDiff;
       bool sessionRecord = data.bestSessionDiff > _lastSessionDiff;
       _lastBestDiff = data.bestDiff;
       _lastSessionDiff = data.bestSessionDiff;
-      if (bestRecord || sessionRecord) {
-        bool led = (data.ledMode == 3) || (data.ledMode == 1 && bestRecord) ||
-                   (data.ledMode == 2 && sessionRecord);
+      if (sessionRecord) {
+        bool led = (data.ledMode == 3) || (data.ledMode == 2);
         startRecordFlash(led);
         return;
       }
@@ -1256,6 +1285,60 @@ void UI::startRecordFlash(bool led) {
   drawNewOverlay(true);
 }
 
+void UI::showBestEverRecord(const String& value, bool led) {
+  _bestEverValue = value;
+  if (!_bestEverActive) {
+    _bestEverActive = true;
+    _bestEverPhase = false;
+    _bestEverNext = millis() + BEST_EVER_BLINK_MS;
+    _suppressTouch = true;
+  }
+  _flashing = false;
+  _lastTouchMs = millis();
+  if (_screenOff) {
+    _screenOff = false;
+    applyPowerState();
+  }
+  if (led) startLedBlink();
+  drawBestEverOverlay();
+}
+
+void UI::drawBestEverOverlay() {
+  bool dark = !_bestEverPhase;
+  uint16_t bg = dark ? C_BEST_EVER_BG : TFT_WHITE;
+  uint16_t fg = dark ? C_WHITE : C_BEST_EVER_RED;
+  _tft.fillScreen(bg);
+
+  drawTextCentered("BEST DIFF EVER", 0, 18, _screenW, 10, FONT_SMALL, fg);
+
+  const uint8_t* fonts[] = {FONT_MEGA, FONT_HERO, FONT_BIG, FONT_VALUE, FONT_SMALL};
+  const uint8_t* valueFont = FONT_SMALL;
+  int maxW = _screenW - 16;
+  for (const uint8_t* font : fonts) {
+    setFont(font, fg);
+    if (textWidth(_bestEverValue.c_str()) <= maxW) {
+      valueFont = font;
+      break;
+    }
+  }
+  drawTextCenteredAt(_bestEverValue.c_str(), _screenW / 2, _screenH / 2, valueFont, fg);
+  drawTextCentered("TOUCH TO CLOSE", 0, _screenH - 30, _screenW, 10, FONT_TINY, fg);
+}
+
+void UI::dismissBestEver() {
+  _bestEverActive = false;
+  _bestEverPhase = false;
+  _bestEverNext = 0;
+  _bestEverValue = "";
+  _flashing = false;
+  _staticDrawn = false;
+  _forceAll = true;
+  _lastBigValue = "";
+  drawCurrentPageStatic();
+  if (_alertActive) drawOfflineAlert(_alertText);
+  _staticDrawn = true;
+}
+
 void UI::drawNewOverlay(bool showText) {
   _tft.fillScreen(TFT_WHITE);
   if (!showText) return;
@@ -1305,6 +1388,10 @@ void UI::resetRecords() {
   _lastBlockFound = 0;
   _lastBestDiff = 0;
   _lastSessionDiff = 0;
+  _bestEverActive = false;
+  _bestEverPhase = false;
+  _bestEverNext = 0;
+  _bestEverValue = "";
   _forceAll = true;
 }
 
@@ -1373,7 +1460,7 @@ void UI::showPage(uint8_t page) {
 }
 
 void UI::nextPage() {
-  if (_flashing || _celebrating) return;
+  if (_flashing || _celebrating || _bestEverActive) return;
   switch (_page) {
     case Page::Dashboard:
       setPage(Page::BestEver);
@@ -1400,7 +1487,7 @@ void UI::nextPage() {
 }
 
 void UI::prevPage() {
-  if (_flashing || _celebrating) return;
+  if (_flashing || _celebrating || _bestEverActive) return;
   switch (_page) {
     case Page::Dashboard:
       setPage(Page::History);
@@ -1437,6 +1524,25 @@ int UI::mapTouchY(int raw) const {
 }
 
 void UI::pollTouch() {
+  if (_bestEverActive) {
+    bool down = _ts.touched();
+    if (!down) {
+      _suppressTouch = false;
+      return;
+    }
+    if (_suppressTouch) return;
+
+    _lastTouchMs = millis();
+    if (_screenOff) {
+      _screenOff = false;
+      applyPowerState();
+    }
+    dismissBestEver();
+    _suppressTouch = true;
+    _touchWasDown = false;
+    return;
+  }
+
   if (_flashing || _celebrating) return;
 
   bool down = _ts.touched();

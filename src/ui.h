@@ -91,6 +91,9 @@ class UI {
   void startCelebration(int blockHeight);
   void startRecordFlash(bool led);
   void drawNewOverlay(bool showText);
+  void showBestEverRecord(const String& value, bool led);
+  void drawBestEverOverlay();
+  void dismissBestEver();
 
   void setLed(bool on);
   void startLedBlink();
@@ -191,6 +194,11 @@ class UI {
   bool _flashing = false;
   uint8_t _flashPhase = 0;
   unsigned long _flashNext = 0;
+
+  bool _bestEverActive = false;
+  bool _bestEverPhase = false;
+  unsigned long _bestEverNext = 0;
+  String _bestEverValue;
 
   bool _ledBlinking = false;
   unsigned long _ledUntil = 0;
