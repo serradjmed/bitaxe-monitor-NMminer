@@ -61,7 +61,8 @@ class UI {
   void drawSideValue(int x, int y, int w, const String& value, uint16_t color);
   void drawBottomValues(const HashRateText& hr, const String& temp, const String& tempUnit,
                         uint16_t tempColorValue);
-  void updateFooter(bool online, bool wifi, const char* ip, unsigned long lastUpdateMs, bool valid);
+  void updateFooter(bool online, bool wifi, const char* ip, unsigned long lastUpdateMs, bool valid,
+                    uint8_t pausedCount);
 
   void drawCurrentPageStatic();
   void drawDashboardStatic();
@@ -86,6 +87,11 @@ class UI {
 
   void drawOfflineAlert(const String& text);
   void drawExclamation(int cx, int top, int height, uint16_t color);
+
+  bool updateThermalAlert(const MinerData& data);
+  void drawThermalAlert(uint8_t level, const MinerEntry& miner, uint8_t hotCount,
+                        uint8_t criticalCount, bool autoPause);
+  void clearThermalAlert();
 
   void drawCelebration(int blockHeight);
   void startCelebration(int blockHeight);
@@ -207,6 +213,15 @@ class UI {
 
   bool _alertActive = false;
   String _alertText;
+
+  bool _tempAlertActive = false;
+  uint8_t _lastTempAlertLevel = 0;
+  int _lastTempAlertTemp = -999;
+  bool _lastTempAlertPaused = false;
+  bool _lastTempAlertAutoPause = false;
+  uint8_t _lastTempAlertHotCount = 0;
+  uint8_t _lastTempAlertCriticalCount = 0;
+  char _lastTempAlertIp[16] = {0};
 
   bool _touchWasDown = false;
   bool _suppressTouch = false;

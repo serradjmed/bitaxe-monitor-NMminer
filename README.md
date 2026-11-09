@@ -26,6 +26,10 @@ Standalone monitor for **Bitaxe Gamma** (AxeOS) on the **ESP32-2432S028R**
 - **Night mode**: lower brightness during a configurable UTC window (NTP is
   configured automatically after Wi-Fi connects).
 - **Screen timeout**: optional blanking after inactivity, wake on touch.
+- **Thermal protection**: full-screen `HIGH TEMP` alert when any miner is above
+  the configurable hot threshold, and optional per-miner auto-pause at the
+  critical threshold. Paused miners resume below hot − 5 °C for 60 s, and the
+  auto-pause state survives monitor reboots.
 - **Offline alert**: large red exclamation mark and `BITAXE OFFLINE` / `WIFI OFFLINE`.
 - **New best diff ever**: full-screen value blinking between dark-red/white and
   white/red until the screen is touched.
@@ -38,7 +42,8 @@ Standalone monitor for **Bitaxe Gamma** (AxeOS) on the **ESP32-2432S028R**
 - **BitaxeMonitor** captive portal on first boot (WiFiManager), with a QR code
   to join the access point from a phone.
 - Local web page to change the Bitaxe IP list, refresh interval, orientation,
-  rotation, brightness, LED mode, night mode, screen timeout, and the screen page.
+  rotation, brightness, LED mode, night mode, screen timeout, thermal thresholds,
+  auto-pause, and the screen page.
 - **Web OTA updates**: upload the application image from the browser after the
   first full flash.
 - **BOOT** long press for 5 s: erase Wi-Fi + settings and reboot.
@@ -114,7 +119,7 @@ After the first full flash, the monitor can update itself from the browser:
 3. Upload: the monitor writes the inactive OTA slot and reboots automatically.
 
 Use the **application-only** image (`*-app.bin`), never the full merged image.
-NVS settings (Wi-Fi, IP list, display, LED, night mode) are preserved. If the upload is
+NVS settings (Wi-Fi, IP list, display, LED, night mode, thermal thresholds) are preserved. If the upload is
 interrupted, the previous firmware remains bootable; retry or flash by USB.
 
 The OTA upload has no authentication. Use it only on a trusted local network.
@@ -140,8 +145,8 @@ the `WIFI OFFLINE` alert.
 Once the monitor is on the network, open `http://<monitor-ip>/`.
 
 - `/`: form for the Bitaxe IP list, refresh interval, orientation, rotation,
-  brightness, LED mode, night mode, and screen timeout. Buttons at the top switch
-  the display page.
+  brightness, LED mode, night mode, screen timeout, hot/critical temperatures,
+  and auto-pause. Buttons at the top switch the display page.
 - `/page?p=0`: switch the display to **Dashboard**.
 - `/page?p=1`: switch the display to **Best Ever**.
 - `/page?p=2`: switch the display to **Best Session**.
@@ -150,9 +155,10 @@ Once the monitor is on the network, open `http://<monitor-ip>/`.
 - `/page?p=5`: switch the display to **Stats**.
 - `/page?p=6`: switch the display to **History**.
 - `/save` (POST): save settings directly. Fields include `ips`, `poll`, `orient`,
-  `flip`, `bright`, `led`, `night`, `nstart`, `nend`, `nbright`, and `timeout`.
-- `/status`: JSON monitor state, including display, night, and per-miner `miners`
-  details.
+  `flip`, `bright`, `led`, `night`, `nstart`, `nend`, `nbright`, `timeout`, `hot`,
+  `critic`, and `autopause`.
+- `/status`: JSON monitor state, including display, night, thermal settings, and
+  per-miner `miners` details.
 - `/update`: firmware update page (upload the `*-app.bin` image).
 - `/restart`: restart the monitor.
 
@@ -185,6 +191,10 @@ If colors are inverted, try `cyd-st7789-inv`. If red and blue are swapped, try
 | Night window | `22:00`–`07:00` UTC |
 | Night brightness | `15 %` |
 | Screen timeout | disabled |
+| Hot alert | `62 °C` |
+| Critical pause | `70 °C` |
+| Auto-pause on critical | enabled |
+| Auto-resume | below hot − 5 °C for `60 s` |
 | Captive portal | `BitaxeMonitor` |
 | Portal timeout | `180 s` |
 | Offline status | as soon as an AxeOS poll fails |
@@ -198,10 +208,29 @@ GET http://<bitaxe-ip>/api/system/info
 
 Fields used: `bestDiff`, `bestSessionDiff`, `networkDifficulty`, `hashRate`,
 `hashRate_1m`, `temp`, `power`, `sharesAccepted`, `sharesRejected`,
-`blockHeight`, `blockFound`, `uptimeSeconds`.
+`blockHeight`, `blockFound`, `uptimeSeconds`, and optionally `miningPaused`.
 
 `bestDiff`, `bestSessionDiff`, and `networkDifficulty` may be numeric or
 suffixed strings (`4.29G`, `144.5T`). The firmware handles both formats.
+
+When auto-pause triggers, the monitor first tries the standard AxeOS endpoints:
+
+```http
+POST http://<bitaxe-ip>/api/system/pause
+POST http://<bitaxe-ip>/api/system/resume
+```
+
+If they are unavailable, it falls back to the NMMiner NMAxe runtime endpoint:
+
+```http
+PATCH http://<bitaxe-ip>/api/mining/state
+Content-Type: application/json
+
+{"paused":true}
+```
+
+Use `{"paused":false}` to resume. Standard AxeOS pause/resume requires a recent
+AxeOS firmware; NMMiner NMAxe requires v3.0.21 or newer.
 
 ## Security
 
@@ -217,6 +246,9 @@ suffixed strings (`4.29G`, `144.5T`). The firmware handles both formats.
 - **Black screen**: check the binary/driver, GPIO21 backlight, and try another variant.
 - **`NO WIFI`**: the monitor is not connected to Wi-Fi; redo the portal or hold
   BOOT for 5 s to reset.
+- **Miner stays paused**: auto-resume waits for the temperature to fall below
+  hot − 5 °C for 60 s. Check that the miner reports temperature while paused, or
+  resume it manually from AxeOS.
 - **`NO MINER`**: Wi-Fi is OK but no AxeOS API is reachable; check the IP list
   from the local web page. The status bar shows `online/total` when multiple
   miners are configured.
@@ -270,8 +302,8 @@ The GitHub Actions workflow builds all four display variants on pushes to
 `main`/`master`, on tags, and on pull requests. To publish a release, push a tag:
 
 ```bash
-git tag v1.2.0
-git push origin v1.2.0
+git tag v1.3.0
+git push origin v1.3.0
 ```
 
 The workflow builds the firmware and attaches the `firmware/*.bin` files to the

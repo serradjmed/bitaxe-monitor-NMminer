@@ -7,6 +7,9 @@
 namespace {
 
 const char* const PREFS_NS = "bitaxe-mon";
+constexpr uint8_t TEMP_RESUME_MARGIN = 5;
+constexpr unsigned long TEMP_RESUME_DELAY_MS = 60000UL;
+constexpr unsigned long TEMP_COMMAND_RETRY_MS = 30000UL;
 
 const char PORTAL_HEAD[] = R"rawliteral(
 <script>
@@ -123,6 +126,10 @@ void MinerClient::loadSettings() {
   _nightEnd = _prefs.getUChar("nend", 7);
   _nightBrightness = _prefs.getUChar("nbright", 15);
   _screenTimeoutSec = _prefs.getUShort("timeout", 0);
+  _hotTemp = _prefs.getUChar("hot", DEFAULT_HOT_TEMP);
+  _criticalTemp = _prefs.getUChar("critic", DEFAULT_CRITICAL_TEMP);
+  _autoPause = _prefs.getBool("autopause", DEFAULT_AUTO_PAUSE != 0);
+  uint8_t pauseMask = _prefs.getUChar("apmask", 0);
   _prefs.end();
 
   if (!applyIpList(raw)) {
@@ -138,7 +145,16 @@ void MinerClient::loadSettings() {
   if (_nightEnd > 23) _nightEnd = 7;
   if (_nightBrightness > 100) _nightBrightness = 15;
   if (_screenTimeoutSec > 3600) _screenTimeoutSec = 0;
+  if (_hotTemp < 40 || _hotTemp > 100) _hotTemp = DEFAULT_HOT_TEMP;
+  if (_criticalTemp < 40 || _criticalTemp > 110) _criticalTemp = DEFAULT_CRITICAL_TEMP;
+  if (_criticalTemp <= _hotTemp) {
+    _criticalTemp = _hotTemp + 5 > 110 ? 110 : _hotTemp + 5;
+  }
   resetMinerStates();
+  for (uint8_t i = 0; i < _ipCount && i < MAX_MINERS; ++i) {
+    _pausedByMonitor[i] = (pauseMask & (1U << i)) != 0;
+    _miners[i].pausedByMonitor = _pausedByMonitor[i];
+  }
 }
 
 void MinerClient::saveSettings() {
@@ -155,6 +171,19 @@ void MinerClient::saveSettings() {
   _prefs.putUChar("nend", _nightEnd);
   _prefs.putUChar("nbright", _nightBrightness);
   _prefs.putUShort("timeout", _screenTimeoutSec);
+  _prefs.putUChar("hot", _hotTemp);
+  _prefs.putUChar("critic", _criticalTemp);
+  _prefs.putBool("autopause", _autoPause);
+  _prefs.end();
+}
+
+void MinerClient::savePauseState() {
+  uint8_t mask = 0;
+  for (uint8_t i = 0; i < MAX_MINERS; ++i) {
+    if (_pausedByMonitor[i]) mask |= (1U << i);
+  }
+  _prefs.begin(PREFS_NS, false);
+  _prefs.putUChar("apmask", mask);
   _prefs.end();
 }
 
@@ -209,6 +238,9 @@ void MinerClient::resetMinerStates() {
     _miners[i] = MinerData();
     _lastBlockFound[i] = 0;
     _blockInit[i] = false;
+    _pausedByMonitor[i] = false;
+    _pauseCoolSince[i] = 0;
+    _lastTempCmdMs[i] = 0;
   }
   _blockCounter = 0;
   _lastBlockHeight = 0;
@@ -302,7 +334,10 @@ void MinerClient::setupWiFi() {
     int l = atoi(paramLed.getValue());
     if (l >= 0 && l <= 3) _ledMode = static_cast<uint8_t>(l);
 
-    if (ipsChanged) resetMinerStates();
+    if (ipsChanged) {
+      resetMinerStates();
+      savePauseState();
+    }
     saveSettings();
     _displayDirty = true;
     _forcePoll = true;
@@ -419,6 +454,8 @@ void MinerClient::poll() {
       }
     }
 
+    updateThermalProtection(i, millis());
+
     if (_miners[i].online != wasOnline) {
       Serial.printf("[axeos] %s %s\n", _ips[i].c_str(), _miners[i].online ? "online" : "offline");
     }
@@ -465,6 +502,8 @@ void MinerClient::pollOne(const String& ip, MinerData& out) {
       out.blockHeight = doc["blockHeight"] | 0;
       out.blockFound = doc["blockFound"] | 0;
       out.uptime = doc["uptimeSeconds"] | 0;
+      out.miningPausedKnown = !doc["miningPaused"].isNull();
+      out.miningPaused = doc["miningPaused"] | false;
 
       out.online = true;
       out.everConnected = true;
@@ -479,12 +518,112 @@ void MinerClient::pollOne(const String& ip, MinerData& out) {
   http.end();
 }
 
+bool MinerClient::sendMiningCommand(const String& ip, bool pause) {
+  auto request = [&](const char* method, const char* path, const char* payload) -> int {
+    WiFiClient client;
+    HTTPClient http;
+    http.setConnectTimeout(1200);
+    http.setTimeout(1800);
+    String url = String("http://") + ip + path;
+    if (!http.begin(client, url)) return -1;
+    http.addHeader("Content-Type", "application/json");
+    int code = http.sendRequest(method, reinterpret_cast<uint8_t*>(const_cast<char*>(payload)),
+                                strlen(payload));
+    http.end();
+    return code;
+  };
+
+  int code = request("POST", pause ? "/api/system/pause" : "/api/system/resume", "");
+  if (code < 200 || code >= 300) {
+    String body = pause ? "{\"paused\":true}" : "{\"paused\":false}";
+    code = request("PATCH", "/api/mining/state", body.c_str());
+  }
+  return code >= 200 && code < 300;
+}
+
+void MinerClient::updateThermalProtection(uint8_t index, unsigned long now) {
+  if (index >= _ipCount) return;
+
+  MinerData& m = _miners[index];
+  if (!m.online || m.temp < -50.0f || m.temp > 150.0f) {
+    _pauseCoolSince[index] = 0;
+    return;
+  }
+
+  bool recentCommand = _lastTempCmdMs[index] != 0 &&
+                       (now - _lastTempCmdMs[index]) < 5000UL;
+  if (_pausedByMonitor[index] && m.miningPausedKnown && !m.miningPaused && !recentCommand) {
+    _pausedByMonitor[index] = false;
+    _pauseCoolSince[index] = 0;
+    savePauseState();
+  }
+  m.pausedByMonitor = _pausedByMonitor[index];
+
+  bool canCommand = _lastTempCmdMs[index] == 0 ||
+                    (now - _lastTempCmdMs[index]) >= TEMP_COMMAND_RETRY_MS;
+  bool alreadyPaused = m.miningPaused || (_pausedByMonitor[index] && !m.miningPausedKnown);
+
+  if (m.temp >= static_cast<float>(_criticalTemp) && _autoPause) {
+    _pauseCoolSince[index] = 0;
+    if (!alreadyPaused && canCommand) {
+      _lastTempCmdMs[index] = now;
+      Serial.printf("[thermal] %s critical %.1fC, pausing\n", _ips[index].c_str(), m.temp);
+      if (sendMiningCommand(_ips[index], true)) {
+        _pausedByMonitor[index] = true;
+        m.pausedByMonitor = true;
+        m.miningPaused = true;
+        m.miningPausedKnown = true;
+        savePauseState();
+        Serial.printf("[thermal] %s paused\n", _ips[index].c_str());
+      } else {
+        Serial.printf("[thermal] %s pause failed\n", _ips[index].c_str());
+      }
+    }
+    return;
+  }
+
+  if (!_pausedByMonitor[index]) {
+    _pauseCoolSince[index] = 0;
+    return;
+  }
+
+  float resumeTemp = static_cast<float>(_hotTemp) - TEMP_RESUME_MARGIN;
+  if (m.temp > resumeTemp) {
+    _pauseCoolSince[index] = 0;
+    return;
+  }
+
+  if (_pauseCoolSince[index] == 0) {
+    _pauseCoolSince[index] = now;
+    return;
+  }
+
+  if ((now - _pauseCoolSince[index]) < TEMP_RESUME_DELAY_MS || !canCommand) return;
+
+  _lastTempCmdMs[index] = now;
+  Serial.printf("[thermal] %s cooled %.1fC, resuming\n", _ips[index].c_str(), m.temp);
+  if (sendMiningCommand(_ips[index], false)) {
+    _pausedByMonitor[index] = false;
+    _pauseCoolSince[index] = 0;
+    m.pausedByMonitor = false;
+    m.miningPaused = false;
+    m.miningPausedKnown = true;
+    savePauseState();
+    Serial.printf("[thermal] %s resumed\n", _ips[index].c_str());
+  } else {
+    Serial.printf("[thermal] %s resume failed\n", _ips[index].c_str());
+  }
+}
+
 MinerData MinerClient::buildAggregate(bool wifi) const {
   MinerData agg;
   agg.wifiConnected = wifi;
   agg.rssi = wifi ? WiFi.RSSI() : 0;
   agg.minerCount = _ipCount;
   agg.ledMode = _ledMode;
+  agg.hotTemp = _hotTemp;
+  agg.criticalTemp = _criticalTemp;
+  agg.autoPause = _autoPause;
 
   if (wifi) {
     String ip = WiFi.localIP().toString();
@@ -501,6 +640,8 @@ MinerData MinerClient::buildAggregate(bool wifi) const {
     MinerEntry& entry = agg.miners[i];
     entry.online = m.online;
     entry.everConnected = m.everConnected;
+    entry.miningPaused = m.miningPaused;
+    entry.pausedByMonitor = m.pausedByMonitor;
     entry.hashRate1m = m.hashRate1m > 0 ? m.hashRate1m : m.hashRate;
     entry.temp = m.temp;
     entry.power = m.power;
@@ -518,6 +659,7 @@ MinerData MinerClient::buildAggregate(bool wifi) const {
     if (m.online) {
       agg.online = true;
       ++agg.onlineCount;
+      if (m.pausedByMonitor || m.miningPaused) ++agg.pausedCount;
       agg.hashRate += m.hashRate;
       agg.hashRate1m += (m.hashRate1m > 0 ? m.hashRate1m : m.hashRate);
       agg.power += m.power;
@@ -683,6 +825,16 @@ void MinerClient::handleRoot() {
       "oninput=\"document.getElementById('nbv').textContent=this.value\">"
       "<label>Screen timeout (seconds, 0 = off)</label>"
       "<input name=\"timeout\" type=\"number\" min=\"0\" max=\"3600\" value=\"%TIMEOUT%\">"
+      "<label>Hot alert temperature (°C)</label>"
+      "<input name=\"hot\" type=\"number\" min=\"40\" max=\"100\" value=\"%HOT%\" required>"
+      "<label>Critical pause temperature (°C)</label>"
+      "<input name=\"critic\" type=\"number\" min=\"40\" max=\"110\" value=\"%CRITIC%\" required>"
+      "<label>Auto-pause on critical temperature</label><select name=\"autopause\">"
+      "<option value=\"0\"%AUTOPAUSE_0%>Disabled</option>"
+      "<option value=\"1\"%AUTOPAUSE_1%>Enabled</option>"
+      "</select>"
+      "<p class=\"sub\" style=\"margin:6px 0 0\">Critical pauses the affected miner. "
+      "It resumes below hot - 5 °C for 60 seconds.</p>"
       "<button>Save</button></form>"
       "<div class=\"status\"><span class=\"dot\"></span>%STATUS%</div>"
       "<p class=\"sub\" style=\"margin:18px 0 0\">Touch: tap the screen to cycle through "
@@ -709,6 +861,10 @@ void MinerClient::handleRoot() {
   html.replace("%NEND%", String(_nightEnd));
   html.replace("%NBRIGHT%", String(_nightBrightness));
   html.replace("%TIMEOUT%", String(_screenTimeoutSec));
+  html.replace("%HOT%", String(_hotTemp));
+  html.replace("%CRITIC%", String(_criticalTemp));
+  html.replace("%AUTOPAUSE_0%", _autoPause ? "" : " selected");
+  html.replace("%AUTOPAUSE_1%", _autoPause ? " selected" : "");
   html.replace("%STATUS%", status);
   html.replace("%DOT%", data.online ? "#34d399" : (data.wifiConnected ? "#fbbf24" : "#f87171"));
 
@@ -765,8 +921,23 @@ void MinerClient::handleSave() {
     int v = _server.arg("timeout").toInt();
     if (v >= 0 && v <= 3600) _screenTimeoutSec = static_cast<uint16_t>(v);
   }
+  if (_server.hasArg("hot")) {
+    int v = _server.arg("hot").toInt();
+    if (v >= 40 && v <= 100) _hotTemp = static_cast<uint8_t>(v);
+  }
+  if (_server.hasArg("critic")) {
+    int v = _server.arg("critic").toInt();
+    if (v >= 40 && v <= 110) _criticalTemp = static_cast<uint8_t>(v);
+  }
+  if (_server.hasArg("autopause")) _autoPause = _server.arg("autopause") == "1";
+  if (_criticalTemp <= _hotTemp) {
+    _criticalTemp = _hotTemp + 5 > 110 ? 110 : _hotTemp + 5;
+  }
   _pollSec = static_cast<uint16_t>(p);
-  if (ipsChanged) resetMinerStates();
+  if (ipsChanged) {
+    resetMinerStates();
+    savePauseState();
+  }
   saveSettings();
   _displayDirty = true;
   _forcePoll = true;
@@ -777,6 +948,8 @@ void MinerClient::handleSave() {
   Serial.printf("[settings] night=%u %u-%u bright=%u timeout=%us\n",
                 _nightEnabled ? 1U : 0U, _nightStart, _nightEnd, _nightBrightness,
                 _screenTimeoutSec);
+  Serial.printf("[settings] hot=%uC critical=%uC autoPause=%u\n", _hotTemp, _criticalTemp,
+                _autoPause ? 1U : 0U);
 
   _server.send(200, "text/html; charset=utf-8",
                "<meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"2;url=/\">"
@@ -815,6 +988,14 @@ void MinerClient::handleStatus() {
   json += data.minerCount;
   json += ",\"onlineCount\":";
   json += data.onlineCount;
+  json += ",\"pausedCount\":";
+  json += data.pausedCount;
+  json += ",\"hotTemp\":";
+  json += _hotTemp;
+  json += ",\"criticalTemp\":";
+  json += _criticalTemp;
+  json += ",\"autoPause\":";
+  json += _autoPause ? "true" : "false";
   json += ",\"ledMode\":";
   json += _ledMode;
   json += ",\"ips\":[";
@@ -878,6 +1059,10 @@ void MinerClient::handleStatus() {
     json += String(m.hashRate1m, 2);
     json += ",\"temp\":";
     json += String(m.temp, 1);
+    json += ",\"paused\":";
+    json += (m.pausedByMonitor || m.miningPaused) ? "true" : "false";
+    json += ",\"pausedByMonitor\":";
+    json += m.pausedByMonitor ? "true" : "false";
     json += ",\"power\":";
     json += String(m.power, 1);
     json += "}";

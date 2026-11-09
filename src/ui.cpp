@@ -8,6 +8,8 @@ constexpr uint8_t BL_LEDC_CHANNEL = 0;
 constexpr unsigned long BEST_EVER_BLINK_MS = 500UL;
 constexpr uint16_t C_BEST_EVER_BG = rgb565(105, 0, 0);
 constexpr uint16_t C_BEST_EVER_RED = rgb565(185, 16, 16);
+constexpr uint16_t C_TEMP_HOT_BG = rgb565(72, 36, 0);
+constexpr uint16_t C_TEMP_CRIT_BG = rgb565(92, 0, 0);
 
 const uint8_t* const FONT_TINY = u8g2_font_helvB08_tf;
 const uint8_t* const FONT_SMALL = u8g2_font_helvB10_tf;
@@ -86,6 +88,14 @@ void UI::applyDisplaySettings(uint8_t orientation, bool flip, uint8_t brightness
   _bestEverNext = 0;
   _bestEverValue = "";
   _celebrating = false;
+  _tempAlertActive = false;
+  _lastTempAlertLevel = 0;
+  _lastTempAlertTemp = -999;
+  _lastTempAlertPaused = false;
+  _lastTempAlertAutoPause = false;
+  _lastTempAlertHotCount = 0;
+  _lastTempAlertCriticalCount = 0;
+  _lastTempAlertIp[0] = 0;
   _ledBlinking = false;
   setLed(false);
   _staticDrawn = false;
@@ -195,7 +205,7 @@ void UI::applyPowerState() {
 
   bool night = isNightNow();
   _nightActive = night;
-  bool timedOut = !_bestEverActive && _screenTimeoutSec > 0 &&
+  bool timedOut = !_bestEverActive && !_tempAlertActive && _screenTimeoutSec > 0 &&
                   (now - _lastTouchMs) >= static_cast<unsigned long>(_screenTimeoutSec) * 1000UL;
   _screenOff = timedOut;
 
@@ -270,6 +280,8 @@ void UI::update(const MinerData& data) {
   if (millis() - _lastPowerCheckMs >= 1000UL) applyPowerState();
 
   bool live = data.online && data.everConnected;
+
+  if (updateThermalAlert(data)) return;
 
   if (_celebrating) {
     if (millis() < _celebrateUntil) return;
@@ -386,7 +398,7 @@ void UI::update(const MinerData& data) {
   }
 
   if (_page == Page::Dashboard && millis() - _lastFooterMs >= 1000UL) {
-    updateFooter(online, wifi, data.deviceIp, data.lastUpdateMs, valid);
+    updateFooter(online, wifi, data.deviceIp, data.lastUpdateMs, valid, data.pausedCount);
     _lastFooterMs = millis();
   }
 
@@ -822,7 +834,8 @@ void UI::drawBottomValues(const HashRateText& hr, const String& temp, const Stri
   }
 }
 
-void UI::updateFooter(bool online, bool wifi, const char* ip, unsigned long lastUpdateMs, bool valid) {
+void UI::updateFooter(bool online, bool wifi, const char* ip, unsigned long lastUpdateMs, bool valid,
+                      uint8_t pausedCount) {
   String left;
   uint16_t color;
 
@@ -837,6 +850,9 @@ void UI::updateFooter(bool online, bool wifi, const char* ip, unsigned long last
   } else if (!online) {
     left = wifi ? "MINER OFFLINE" : "WIFI OFFLINE";
     color = C_RED;
+  } else if (pausedCount > 0) {
+    left = "MINING PAUSED";
+    color = C_AMBER;
   } else {
     unsigned long age = (millis() - lastUpdateMs) / 1000UL;
     if (age < 1) {
@@ -875,6 +891,7 @@ void UI::updateMinersPage(const MinerData& data) {
     const MinerEntry& e = data.miners[i];
     sig += "|";
     sig += e.online ? "1" : "0";
+    sig += (e.miningPaused || e.pausedByMonitor) ? "1" : "0";
     sig += String(e.hashRate1m, 1);
     sig += String(e.temp, 1);
     sig += String(e.power, 1);
@@ -906,7 +923,9 @@ void UI::updateMinersPage(const MinerData& data) {
     }
 
     const MinerEntry& e = data.miners[i];
-    uint16_t color = e.online ? C_GREEN : (e.everConnected ? C_RED : C_DIM);
+    bool paused = e.miningPaused || e.pausedByMonitor;
+    uint16_t color = e.online ? (paused ? C_AMBER : C_GREEN)
+                              : (e.everConnected ? C_RED : C_DIM);
     _tft.fillCircle(x + 6, rowY + rowH / 2, 3, color);
     drawTextAt(e.ip, x + 14, rowY + 1, 10, FONT_TINY, e.online ? C_WHITE : C_DIM);
 
@@ -915,6 +934,11 @@ void UI::updateMinersPage(const MinerData& data) {
       values = "NOT CONNECTED";
     } else if (!e.online) {
       values = "OFFLINE";
+    } else if (paused) {
+      values = "PAUSED";
+      if (e.temp >= -50.0f && e.temp <= 150.0f) {
+        values += "  " + String(static_cast<int>(roundf(e.temp))) + "C";
+      }
     } else {
       HashRateText hr = formatHashRate(e.hashRate1m, true);
       values = hr.value + hr.unit + "  ";
@@ -924,7 +948,7 @@ void UI::updateMinersPage(const MinerData& data) {
       values += String(static_cast<int>(roundf(e.power))) + "W";
     }
     drawTextRight(values.c_str(), x + 14, rowY + valueY, w - 18, 10, FONT_TINY,
-                  e.online ? C_MUTED : color);
+                  e.online ? (paused ? C_AMBER : C_MUTED) : color);
   }
 }
 
@@ -1277,6 +1301,124 @@ void UI::drawExclamation(int cx, int top, int height, uint16_t color) {
   _tft.fillCircle(cx, dotY, dotR, color);
 }
 
+bool UI::updateThermalAlert(const MinerData& data) {
+  uint8_t level = 0;
+  uint8_t hotCount = 0;
+  uint8_t criticalCount = 0;
+  const MinerEntry* hottest = nullptr;
+
+  for (uint8_t i = 0; i < data.minerCount && i < MAX_MINERS; ++i) {
+    const MinerEntry& e = data.miners[i];
+    if (!e.online || e.temp < -50.0f || e.temp > 150.0f) continue;
+
+    if (e.temp >= static_cast<float>(data.criticalTemp)) {
+      ++criticalCount;
+      level = 2;
+    } else if (e.temp >= static_cast<float>(data.hotTemp)) {
+      ++hotCount;
+      if (level < 1) level = 1;
+    }
+
+    if (hottest == nullptr || e.temp > hottest->temp) hottest = &e;
+  }
+
+  if (level == 0 || hottest == nullptr) {
+    clearThermalAlert();
+    return false;
+  }
+
+  bool paused = hottest->pausedByMonitor || hottest->miningPaused;
+  int rounded = static_cast<int>(roundf(hottest->temp));
+  bool changed = !_tempAlertActive || level != _lastTempAlertLevel ||
+                 rounded != _lastTempAlertTemp || paused != _lastTempAlertPaused ||
+                 data.autoPause != _lastTempAlertAutoPause ||
+                 hotCount != _lastTempAlertHotCount ||
+                 criticalCount != _lastTempAlertCriticalCount ||
+                 strcmp(hottest->ip, _lastTempAlertIp) != 0;
+  if (!changed) return true;
+
+  _tempAlertActive = true;
+  _lastTempAlertLevel = level;
+  _lastTempAlertTemp = rounded;
+  _lastTempAlertPaused = paused;
+  _lastTempAlertAutoPause = data.autoPause;
+  _lastTempAlertHotCount = hotCount;
+  _lastTempAlertCriticalCount = criticalCount;
+  strncpy(_lastTempAlertIp, hottest->ip, sizeof(_lastTempAlertIp) - 1);
+  _lastTempAlertIp[sizeof(_lastTempAlertIp) - 1] = 0;
+  _lastTouchMs = millis();
+  if (_screenOff) {
+    _screenOff = false;
+    applyPowerState();
+  }
+  drawThermalAlert(level, *hottest, hotCount, criticalCount, data.autoPause);
+  return true;
+}
+
+void UI::drawThermalAlert(uint8_t level, const MinerEntry& miner, uint8_t hotCount,
+                          uint8_t criticalCount, bool autoPause) {
+  bool critical = level >= 2;
+  uint16_t bg = critical ? C_TEMP_CRIT_BG : C_TEMP_HOT_BG;
+  uint16_t accent = critical ? C_RED : C_AMBER;
+  _tft.fillScreen(bg);
+
+  drawTextCentered(critical ? "CRITICAL TEMP" : "HIGH TEMP", 0, _landscape ? 14 : 24,
+                   _screenW, 16, FONT_VALUE, accent);
+
+  String unit;
+  String value = formatTemp(miner.temp, true, unit);
+  String temp = value + unit;
+  drawTextCenteredAt(temp.c_str(), _screenW / 2, _landscape ? 78 : 112, FONT_MEGA, C_WHITE);
+  drawTextCenteredAt(miner.ip, _screenW / 2, _landscape ? 132 : 194, FONT_VALUE, C_WHITE);
+
+  String status;
+  if (critical) {
+    if (miner.pausedByMonitor || miner.miningPaused) {
+      status = "MINING PAUSED";
+    } else if (autoPause) {
+      status = "PAUSE PENDING";
+    } else {
+      status = "AUTO-PAUSE DISABLED";
+    }
+  } else {
+    status = "COOLING REQUIRED";
+  }
+  drawTextCentered(status.c_str(), 0, _landscape ? 158 : 232, _screenW, 14, FONT_SMALL,
+                   C_WHITE);
+
+  String detail;
+  if (critical) {
+    if (criticalCount > 1) {
+      detail = String(criticalCount) + " MINERS CRITICAL";
+    } else if (hotCount > 0) {
+      detail = String(hotCount) + " MORE ABOVE HOT";
+    }
+  } else if (hotCount > 1) {
+    detail = String(hotCount) + " MINERS HOT";
+  }
+  if (detail.length() > 0) {
+    drawTextCentered(detail.c_str(), 0, _landscape ? 190 : 270, _screenW, 12, FONT_SMALL,
+                     accent);
+  }
+}
+
+void UI::clearThermalAlert() {
+  if (!_tempAlertActive) return;
+
+  _tempAlertActive = false;
+  _lastTempAlertLevel = 0;
+  _lastTempAlertTemp = -999;
+  _lastTempAlertPaused = false;
+  _lastTempAlertAutoPause = false;
+  _lastTempAlertHotCount = 0;
+  _lastTempAlertCriticalCount = 0;
+  _lastTempAlertIp[0] = 0;
+  _lastTouchMs = millis();
+  _staticDrawn = false;
+  _forceAll = true;
+  _lastBigValue = "";
+}
+
 void UI::startRecordFlash(bool led) {
   _flashing = true;
   _flashPhase = 0;
@@ -1460,7 +1602,7 @@ void UI::showPage(uint8_t page) {
 }
 
 void UI::nextPage() {
-  if (_flashing || _celebrating || _bestEverActive) return;
+  if (_flashing || _celebrating || _bestEverActive || _tempAlertActive) return;
   switch (_page) {
     case Page::Dashboard:
       setPage(Page::BestEver);
@@ -1487,7 +1629,7 @@ void UI::nextPage() {
 }
 
 void UI::prevPage() {
-  if (_flashing || _celebrating || _bestEverActive) return;
+  if (_flashing || _celebrating || _bestEverActive || _tempAlertActive) return;
   switch (_page) {
     case Page::Dashboard:
       setPage(Page::History);
@@ -1524,6 +1666,22 @@ int UI::mapTouchY(int raw) const {
 }
 
 void UI::pollTouch() {
+  if (_tempAlertActive) {
+    bool down = _ts.touched();
+    if (down) {
+      _lastTouchMs = millis();
+      if (_screenOff) {
+        _screenOff = false;
+        applyPowerState();
+      }
+      _suppressTouch = true;
+    } else if (_suppressTouch) {
+      _suppressTouch = false;
+    }
+    _touchWasDown = false;
+    return;
+  }
+
   if (_bestEverActive) {
     bool down = _ts.touched();
     if (!down) {

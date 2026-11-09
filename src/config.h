@@ -6,7 +6,7 @@
 // Firmware
 // ---------------------------------------------------------------------------
 #define FW_NAME "Bitaxe Monitor"
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.3.0"
 
 // ---------------------------------------------------------------------------
 // Display / board
@@ -41,6 +41,9 @@
 #define DEFAULT_ORIENTATION 0  // 0 = portrait, 1 = landscape
 #define DEFAULT_FLIP 0         // 0 = normal, 1 = rotated 180 degrees
 #define DEFAULT_BRIGHTNESS 100 // 0..100
+#define DEFAULT_HOT_TEMP 62
+#define DEFAULT_CRITICAL_TEMP 70
+#define DEFAULT_AUTO_PAUSE 1
 #define WIFI_PORTAL_NAME "BitaxeMonitor"
 #define WIFI_PORTAL_TIMEOUT 180  // seconds
 
